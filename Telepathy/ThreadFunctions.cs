@@ -10,6 +10,10 @@
 // let's even keep them in a STATIC CLASS so it's 100% obvious that this should
 // NOT EVER be changed to non static!
 using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.IO;
+using System.Net;
 using System.Net.Sockets;
 using System.Threading;
 
@@ -38,9 +42,63 @@ namespace Telepathy
                 return false;
             }
         }
+        // send message (via stream) with the <size,content> message structure
+        // this function is blocking sometimes!
+        // (e.g. if someone has high latency or wire was cut off)
+        // -> payload is of multiple <<size, content, size, content, ...> parts
+        public static bool SendMessagesBlocking_UDP(UdpClient udpClient, IPEndPoint endPoint, byte[] payload, int packetSize)
+        {
+            // stream.Write throws exceptions if client sends with high
+            // frequency and the server stops
+            try
+            {
+                // write the whole thing
+                udpClient.Send(payload, packetSize, endPoint);
+                return true;
+            }
+            catch (Exception exception)
+            {
+                // log as regular message because servers do shut down sometimes
+                Log.Info("Send: stream.Write exception: " + exception);
+                return false;
+            }
+        }
         // read message (via stream) blocking.
         // writes into byte[] and returns bytes written to avoid allocations.
         public static bool ReadMessageBlocking(NetworkStream stream, int MaxMessageSize, byte[] headerBuffer, byte[] payloadBuffer, out int size)
+        {
+            size = 0;
+
+            // buffer needs to be of Header + MaxMessageSize
+            if (payloadBuffer.Length != 4 + MaxMessageSize)
+            {
+                Log.Error($"ReadMessageBlocking: payloadBuffer needs to be of size 4 + MaxMessageSize = {4 + MaxMessageSize} instead of {payloadBuffer.Length}");
+                return false;
+            }
+
+            // read exactly 4 bytes for header (blocking)
+            if (!stream.ReadExactly(headerBuffer, 4))
+                return false;
+
+            // convert to int
+            size = Utils.BytesToIntBigEndian(headerBuffer);
+
+            // protect against allocation attacks. an attacker might send
+            // multiple fake '2GB header' packets in a row, causing the server
+            // to allocate multiple 2GB byte arrays and run out of memory.
+            //
+            // also protect against size <= 0 which would cause issues
+            if (size > 0 && size <= MaxMessageSize)
+            {
+                // read exactly 'size' bytes for content (blocking)
+                return stream.ReadExactly(payloadBuffer, size);
+            }
+            Log.Warning("ReadMessageBlocking: possible header attack with a header of: " + size + " bytes.");
+            return false;
+        }
+        // read message (via stream) blocking.
+        // writes into byte[] and returns bytes written to avoid allocations.
+        public static bool ReadMessageBlocking(MemoryStream stream, int MaxMessageSize, byte[] headerBuffer, byte[] payloadBuffer, out int size)
         {
             size = 0;
 
@@ -171,6 +229,128 @@ namespace Telepathy
                 receivePipe.Enqueue(connectionId, EventType.Disconnected, default);
             }
         }
+        
+        // thread receive function is the same for client and server's clients
+        public static void ReceiveLoop_UDP(ConcurrentDictionary<int, ConnectionState> clients, UdpClient udpClient, int MaxMessageSize, MagnificentReceivePipe receivePipe, int QueueLimit)
+        {
+            byte[] receiveBuffer = new byte[4 + MaxMessageSize];
+
+            byte[] headerBuffer = new byte[4];
+
+            MemoryStream stream = new MemoryStream(new byte[MaxMessageSize * 2]);
+
+            IPEndPoint endPoint = default;
+
+            Dictionary<IPEndPoint, int> endPointHashToConnectionId =
+                new Dictionary<IPEndPoint, int>();
+
+            int connectionId = default;
+            try
+            {
+                // TODO: only tcp connected, maybe we can write udpConnected event.
+                while (true)
+                {
+                    var receivedBytes = udpClient.Receive(ref endPoint);
+                    if (receivedBytes.Length > MaxMessageSize)
+                    {
+                        Log.Warning("ReadMessageBlocking: possible header attack with a header of: " + receivedBytes.Length + " bytes.");
+                        continue;
+                    }
+
+                    var possibleNewConnection = false;
+                    if (!endPointHashToConnectionId.TryGetValue(endPoint, out var clientConnectionId))
+                    {
+                        foreach (var kvp in clients)
+                        {
+                            var connectionState = kvp.Value;
+                            var client = connectionState.client;
+                            var clientRemoteEndPoint = client.Client.RemoteEndPoint as IPEndPoint;
+                            var clientEndPoint = new IPEndPoint(clientRemoteEndPoint.Address.MapToIPv6(), clientRemoteEndPoint.Port);
+                            var receiveEndPointV6 = new IPEndPoint(endPoint.Address.MapToIPv6(), endPoint.Port);
+                            if (clientEndPoint.Equals(receiveEndPointV6))
+                            {
+                                possibleNewConnection = true;
+                                clientConnectionId = kvp.Key;
+                                break;
+                            }
+                        }
+
+                        if (!possibleNewConnection)
+                        {
+                            Log.Error($"Tcp client not found for udp client {endPoint}");
+                            continue;
+                        }
+                    }
+
+                    connectionId = clientConnectionId;
+
+                    stream.Position = 0u;
+                    stream.Write(receivedBytes, 0, receivedBytes.Length);
+                    stream.Position = 0u;
+                    if (!ReadMessageBlocking(stream, MaxMessageSize, headerBuffer, receiveBuffer, out int size))
+                        // break instead of return so stream close still happens!
+                        break;
+
+                    // create arraysegment for the read message
+                    ArraySegment<byte> message = new ArraySegment<byte>(receiveBuffer, 0, size);
+
+                    // TODO: Implement connection message with token. See: 111432
+                    if (possibleNewConnection && size == 4)
+                    {
+                        if (Utils.BytesToIntBigEndian(message.Array) == 555555)
+                        {
+                            endPointHashToConnectionId.Add(endPoint, clientConnectionId);
+                            clients[clientConnectionId].SetUdpEndPoint(endPoint);
+                        }
+                        else
+                        {
+                            Log.Error($"Invalid connection message from {endPoint}");
+                        }
+                        continue;
+                    }
+
+                    // send to main thread via pipe
+                    // -> it'll copy the message internally so we can reuse the
+                    //    receive buffer for next read!
+                    receivePipe.Enqueue(clientConnectionId, EventType.Data, message);
+
+                    // disconnect if receive pipe gets too big for this connectionId.
+                    // -> avoids ever growing queue memory if network is slower
+                    //    than input
+                    // -> disconnecting is great for load balancing. better to
+                    //    disconnect one connection than risking every
+                    //    connection / the whole server
+                    if (receivePipe.Count(clientConnectionId) >= QueueLimit)
+                    {
+                        // log the reason
+                        Log.Warning($"receivePipe reached limit of {QueueLimit} for connectionId {clientConnectionId}");
+                    }
+                }
+            }
+            catch (Exception exception)
+            {
+                // something went wrong. the thread was interrupted or the
+                // connection closed or we closed our own connection or ...
+                // -> either way we should stop gracefully
+                Log.Info("ReceiveLoop_UDP: finished receive function for connectionId=" + connectionId + " reason: " + exception);
+            }
+            finally
+            {
+                endPointHashToConnectionId.Clear();
+                stream.Close();
+                // clean up no matter what
+                //stream.Close();
+                //client.Close();
+
+                // add 'Disconnected' message after disconnecting properly.
+                // -> always AFTER closing the streams to avoid a race condition
+                //    where Disconnected -> Reconnect wouldn't work because
+                //    Connected is still true for a short moment before the stream
+                //    would be closed.
+                //receivePipe.Enqueue(connectionId, EventType.Disconnected, default);
+            }
+        }
+        
         // thread send function
         // note: we really do need one per connection, so that if one connection
         //       blocks, the rest will still continue to get sends
@@ -238,6 +418,78 @@ namespace Telepathy
                 // though we can't send anymore.
                 stream.Close();
                 client.Close();
+            }
+        }
+        // thread send function
+        // note: we really do need one per connection, so that if one connection
+        //       blocks, the rest will still continue to get sends
+        public static void SendLoop_UDP(int connectionId, ConnectionState connectionState, UdpClient udpClient)
+        {
+            var client = connectionState.client;
+            var sendPending = connectionState.sendPending_UDP;
+            var sendPipe = connectionState.sendPipe_UDP;
+            
+            // avoid payload[packetSize] allocations. size increases dynamically as
+            // needed for batching.
+            byte[] payload = null;
+            
+            try
+            {
+                // byte[] data = Encoding.ASCII.GetBytes("Hello World");
+                // byte[] dataw = new byte[data.Length + 4];
+                // Utils.IntToBytesBigEndianNonAlloc(data.Length, dataw, 0);
+                // Array.Copy(data, 0, dataw, 4, data.Length);
+                // udpClient.Send(dataw, dataw.Length, remoteEndPoint);
+                
+                while (client.Connected) // try this. client will get closed eventually.
+                {
+                    sendPending.Reset(); // WaitOne() blocks until .Set() again
+                    if (connectionState.udpEndPoint != default)
+                    {
+                        if (sendPipe.DequeueAndSerializeAll(ref payload, out int packetSize))
+                        {
+                            // send messages (blocking) or stop if stream is closed
+                        
+                            if (!SendMessagesBlocking_UDP(udpClient, connectionState.udpEndPoint, payload, packetSize))
+                                // break instead of return so stream close still happens!
+                                break;
+                        }
+                    }
+                    else
+                    {
+                        Log.Warning(
+                            $"SendLoop_UDP_Server: udpEndPoint is default. connectionId={connectionId}");
+                    }
+
+                    // don't choke up the CPU: wait until queue not empty anymore
+                    sendPending.WaitOne();
+                }
+            }
+            catch (ThreadAbortException)
+            {
+                // happens on stop. don't log anything.
+            }
+            catch (ThreadInterruptedException)
+            {
+                // happens if receive thread interrupts send thread.
+            }
+            catch (Exception exception)
+            {
+                // something went wrong. the thread was interrupted or the
+                // connection closed or we closed our own connection or ...
+                // -> either way we should stop gracefully
+                Log.Info("SendLoop_UDP Exception: connectionId=" + connectionId + " reason: " + exception);
+            }
+            finally
+            {
+                // clean up no matter what
+                // we might get SocketExceptions when sending if the 'host has
+                // failed to respond' - in which case we should close the connection
+                // which causes the ReceiveLoop to end and fire the Disconnected
+                // message. otherwise the connection would stay alive forever even
+                // though we can't send anymore.
+                //stream.Close();
+                //client.Close();
             }
         }
     }

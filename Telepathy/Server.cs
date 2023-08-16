@@ -17,7 +17,9 @@ namespace Telepathy
 
         // listener
         public TcpListener listener;
+        public UdpClient udpListener;
         Thread listenerThread;
+        Thread receiveThread_UDP = default;
 
         // disconnect if send queue gets too big.
         // -> avoids ever growing queue memory if network is slower than input
@@ -97,6 +99,45 @@ namespace Telepathy
                 listener.Start();
                 Log.Info("Server: listening port=" + port);
 
+                udpListener = new UdpClient(port, AddressFamily.InterNetworkV6);
+                udpListener.Client.SendTimeout = SendTimeout;
+                udpListener.Client.ReceiveTimeout = ReceiveTimeout;
+                // TODO: WE CAN SET RECEIVER BUFFER SIZE OF UDP
+
+                // spawn a receive thread for each client
+                receiveThread_UDP = new Thread(() =>
+                {
+                    // wrap in try-catch, otherwise Thread exceptions
+                    // are silent
+                    try
+                    {
+                        // run the receive loop
+                        // (receive pipe is shared across all loops)
+                        ThreadFunctions.ReceiveLoop_UDP(clients, udpListener, MaxMessageSize, receivePipe,
+                            ReceiveQueueLimit);
+
+                        // IMPORTANT: do NOT remove from clients after the
+                        // thread ends. need to do it in Tick() so that the
+                        // disconnect event in the pipe is still processed.
+                        // (removing client immediately would mean that the
+                        //  pipe is lost and the disconnect event is never
+                        //  processed)
+
+                        // sendthread might be waiting on ManualResetEvent,
+                        // so let's make sure to end it if the connection
+                        // closed.
+                        // otherwise the send thread would only end if it's
+                        // actually sending data while the connection is
+                        // closed.
+                    }
+                    catch (Exception exception)
+                    {
+                        Log.Error("Server client thread UDP exception: " + exception);
+                    }
+                });
+                receiveThread_UDP.IsBackground = true;
+                receiveThread_UDP.Start();
+
                 // keep accepting new clients
                 while (true)
                 {
@@ -105,7 +146,6 @@ namespace Telepathy
                     // dispose after thread was started but we still need it
                     // in the thread
                     TcpClient client = listener.AcceptTcpClient();
-
                     // set socket options
                     client.NoDelay = NoDelay;
                     client.SendTimeout = SendTimeout;
@@ -143,6 +183,31 @@ namespace Telepathy
                     });
                     sendThread.IsBackground = true;
                     sendThread.Start();
+                
+                    Thread sendThread_UDP = new Thread(() =>
+                    {
+                        // wrap in try-catch, otherwise Thread exceptions
+                        // are silent
+                        try
+                        {
+                            // run the send loop
+                            // IMPORTANT: DO NOT SHARE STATE ACROSS MULTIPLE THREADS!
+                            ThreadFunctions.SendLoop_UDP(connectionId, connection, udpListener);
+                        }
+                        catch (ThreadAbortException)
+                        {
+                            // happens on stop. don't log anything.
+                            // (we catch it in SendLoop too, but it still gets
+                            //  through to here when aborting. don't show an
+                            //  error.)
+                        }
+                        catch (Exception exception)
+                        {
+                            Log.Error("Server send thread UDP exception: " + exception);
+                        }
+                    });
+                    sendThread_UDP.IsBackground = true;
+                    sendThread_UDP.Start();
 
                     // spawn a receive thread for each client
                     Thread receiveThread = new Thread(() =>
@@ -153,7 +218,8 @@ namespace Telepathy
                         {
                             // run the receive loop
                             // (receive pipe is shared across all loops)
-                            ThreadFunctions.ReceiveLoop(connectionId, client, MaxMessageSize, receivePipe, ReceiveQueueLimit);
+                            ThreadFunctions.ReceiveLoop(connectionId, client, MaxMessageSize, receivePipe,
+                                ReceiveQueueLimit);
 
                             // IMPORTANT: do NOT remove from clients after the
                             // thread ends. need to do it in Tick() so that the
@@ -169,6 +235,7 @@ namespace Telepathy
                             // actually sending data while the connection is
                             // closed.
                             sendThread.Interrupt();
+                            sendThread_UDP.Interrupt();
                         }
                         catch (Exception exception)
                         {
@@ -235,12 +302,15 @@ namespace Telepathy
             // (might be null if we call Stop so quickly after Start that the
             //  thread was interrupted before even creating the listener)
             listener?.Stop();
+            udpListener?.Close();
 
             // kill listener thread at all costs. only way to guarantee that
             // .Active is immediately false after Stop.
             // -> calling .Join would sometimes wait forever
             listenerThread?.Interrupt();
             listenerThread = null;
+            receiveThread_UDP?.Interrupt();
+            receiveThread_UDP = null;
 
             // close all client connections
             foreach (KeyValuePair<int, ConnectionState> kvp in clients)
@@ -279,6 +349,61 @@ namespace Telepathy
                         // times if other side lags or wire was disconnected)
                         connection.sendPipe.Enqueue(message);
                         connection.sendPending.Set(); // interrupt SendThread WaitOne()
+                        return true;
+                    }
+                    // disconnect if send queue gets too big.
+                    // -> avoids ever growing queue memory if network is slower
+                    //    than input
+                    // -> disconnecting is great for load balancing. better to
+                    //    disconnect one connection than risking every
+                    //    connection / the whole server
+                    //
+                    // note: while SendThread always grabs the WHOLE send queue
+                    //       immediately, it's still possible that the sending
+                    //       blocks for so long that the send queue just gets
+                    //       way too big. have a limit - better safe than sorry.
+                    else
+                    {
+                        // log the reason
+                        Log.Warning($"Server.Send: sendPipe for connection {connectionId} reached limit of {SendQueueLimit}. This can happen if we call send faster than the network can process messages. Disconnecting this connection for load balancing.");
+
+                        // just close it. send thread will take care of the rest.
+                        connection.client.Close();
+                        return false;
+                    }
+                }
+
+                // sending to an invalid connectionId is expected sometimes.
+                // for example, if a client disconnects, the server might still
+                // try to send for one frame before it calls GetNextMessages
+                // again and realizes that a disconnect happened.
+                // so let's not spam the console with log messages.
+                //Logger.Log("Server.Send: invalid connectionId: " + connectionId);
+                return false;
+            }
+            Log.Error("Server.Send: message too big: " + message.Count + ". Limit: " + MaxMessageSize);
+            return false;
+        }
+
+        // send message to client using socket connection.
+        // arraysegment for allocation free sends later.
+        // -> the segment's array is only used until Send() returns!
+        public bool Send_UDP(int connectionId, ArraySegment<byte> message)
+        {
+            // respect max message size to avoid allocation attacks.
+            if (message.Count <= MaxMessageSize)
+            {
+                // find the connection
+                if (clients.TryGetValue(connectionId, out ConnectionState connection))
+                {
+                    // check send pipe limit
+                    if (connection.sendPipe_UDP.Count < SendQueueLimit)
+                    {
+                        // add to thread safe send pipe and return immediately.
+                        // calling Send here would be blocking (sometimes for long
+                        // times if other side lags or wire was disconnected)
+                        connection.sendPipe_UDP.Enqueue(message);
+                        connection.sendPending_UDP.Set(); // interrupt SendThread WaitOne()
                         return true;
                     }
                     // disconnect if send queue gets too big.

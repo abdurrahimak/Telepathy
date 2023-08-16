@@ -1,4 +1,6 @@
 ﻿using System;
+using System.Collections.Concurrent;
+using System.Net;
 using System.Net.Sockets;
 using System.Threading;
 
@@ -15,6 +17,7 @@ namespace Telepathy
     class ClientConnectionState : ConnectionState
     {
         public Thread receiveThread;
+        public UdpClient udpClient;
 
         // TcpClient.Connected doesn't check if socket != null, which
         // results in NullReferenceExceptions if connection was closed.
@@ -50,11 +53,17 @@ namespace Telepathy
             receivePipe = new MagnificentReceivePipe(MaxMessageSize);
         }
 
+        public void CreateUdpClient(IPEndPoint ipEndPoint)
+        {
+            udpClient = new UdpClient(ipEndPoint.Port, ipEndPoint.AddressFamily);
+        }
+
         // dispose all the state safely
         public void Dispose()
         {
             // close client
             client.Close();
+            udpClient?.Close();
 
             // wait until thread finished. this is the only way to guarantee
             // that we can call Connect() again immediately after Disconnect
@@ -77,6 +86,7 @@ namespace Telepathy
             // let go of this client completely. the thread ended, no one uses
             // it anymore and this way Connected is false again immediately.
             client = null;
+            udpClient = null;
         }
     }
 
@@ -124,6 +134,8 @@ namespace Telepathy
 
         {
             Thread sendThread = null;
+            Thread sendThread_UDP = null;
+            Thread receiveThread_UDP = null;
 
             // absolutely must wrap with try/catch, otherwise thread
             // exceptions are silent
@@ -139,11 +151,40 @@ namespace Telepathy
                 state.client.SendTimeout = SendTimeout;
                 state.client.ReceiveTimeout = ReceiveTimeout;
 
+                state.CreateUdpClient(state.client.Client.LocalEndPoint as IPEndPoint);
+                state.udpClient.Client.SendTimeout = SendTimeout;
+                state.udpClient.Client.ReceiveTimeout = ReceiveTimeout;
+
+                // TODO: Implement connection message with token. See: 111432 
+                int connectionMessageId = 555555;
+                byte[] data = new byte[8];
+                Utils.IntToBytesBigEndianNonAlloc(4, data, 0);
+                Utils.IntToBytesBigEndianNonAlloc(connectionMessageId, data, 4);
+                state.udpClient.Send(data, data.Length, state.udpEndPoint);
+                //block udp connection.
+                
+                Console.WriteLine("Client UDP: connected to ip=" + ip + " port=" + port);
+                
+
                 // start send thread only after connected
                 // IMPORTANT: DO NOT SHARE STATE ACROSS MULTIPLE THREADS!
                 sendThread = new Thread(() => { ThreadFunctions.SendLoop(0, state.client, state.sendPipe, state.sendPending); });
                 sendThread.IsBackground = true;
                 sendThread.Start();
+                
+                // start send thread only after connected
+                // IMPORTANT: DO NOT SHARE STATE ACROSS MULTIPLE THREADS!
+                sendThread_UDP = new Thread(() => { ThreadFunctions.SendLoop_UDP(0, state, state.udpClient); });
+                sendThread_UDP.IsBackground = true;
+                sendThread_UDP.Start();
+                
+                // start send thread only after connected
+                // IMPORTANT: DO NOT SHARE STATE ACROSS MULTIPLE THREADS!
+                var servers = new ConcurrentDictionary<int, ConnectionState>();
+                servers.TryAdd(0, state);
+                receiveThread_UDP = new Thread(() => { ThreadFunctions.ReceiveLoop_UDP(servers, state.udpClient, MaxMessageSize, state.receivePipe, ReceiveQueueLimit); });
+                receiveThread_UDP.IsBackground = true;
+                receiveThread_UDP.Start();
 
                 // run the receive loop
                 // (receive pipe is shared across all loops)
@@ -184,6 +225,8 @@ namespace Telepathy
             // actually sending data while the connection is
             // closed.
             sendThread?.Interrupt();
+            sendThread_UDP?.Interrupt();
+            receiveThread_UDP?.Interrupt();
 
             // Connect might have failed. thread might have been closed.
             // let's reset connecting state no matter what.
@@ -193,6 +236,7 @@ namespace Telepathy
             // but we may never get there if connect fails. so let's clean up
             // here too.
             state.client?.Close();
+            state.udpClient?.Close();
         }
 
         public void Connect(string ip, int port)
@@ -208,6 +252,8 @@ namespace Telepathy
             // data races where an old dieing thread might still modify the
             // current state! fixes all the flaky tests!
             state = new ClientConnectionState(MaxMessageSize);
+            var udpEndPoint = new IPEndPoint(IPAddress.Parse(ip), port);
+            state.SetUdpEndPoint(udpEndPoint);
 
             // We are connecting from now until Connect succeeds or fails
             state.Connecting = true;
@@ -273,6 +319,52 @@ namespace Telepathy
                         // times if other side lags or wire was disconnected)
                         state.sendPipe.Enqueue(message);
                         state.sendPending.Set(); // interrupt SendThread WaitOne()
+                        return true;
+                    }
+                    // disconnect if send queue gets too big.
+                    // -> avoids ever growing queue memory if network is slower
+                    //    than input
+                    // -> avoids ever growing latency as well
+                    //
+                    // note: while SendThread always grabs the WHOLE send queue
+                    //       immediately, it's still possible that the sending
+                    //       blocks for so long that the send queue just gets
+                    //       way too big. have a limit - better safe than sorry.
+                    else
+                    {
+                        // log the reason
+                        Log.Warning($"Client.Send: sendPipe reached limit of {SendQueueLimit}. This can happen if we call send faster than the network can process messages. Disconnecting to avoid ever growing memory & latency.");
+
+                        // just close it. send thread will take care of the rest.
+                        state.client.Close();
+                        return false;
+                    }
+                }
+                Log.Error("Client.Send: message too big: " + message.Count + ". Limit: " + MaxMessageSize);
+                return false;
+            }
+            Log.Warning("Client.Send: not connected!");
+            return false;
+        }
+
+        // send message to server using socket connection.
+        // arraysegment for allocation free sends later.
+        // -> the segment's array is only used until Send() returns!
+        public bool Send_UDP(ArraySegment<byte> message)
+        {
+            if (Connected)
+            {
+                // respect max message size to avoid allocation attacks.
+                if (message.Count <= MaxMessageSize)
+                {
+                    // check send pipe limit
+                    if (state.sendPipe_UDP.Count < SendQueueLimit)
+                    {
+                        // add to thread safe send pipe and return immediately.
+                        // calling Send here would be blocking (sometimes for long
+                        // times if other side lags or wire was disconnected)
+                        state.sendPipe_UDP.Enqueue(message);
+                        state.sendPending_UDP.Set(); // interrupt SendThread WaitOne()
                         return true;
                     }
                     // disconnect if send queue gets too big.

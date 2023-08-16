@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using NUnit.Framework;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace Telepathy.Tests
 {
@@ -30,10 +31,15 @@ namespace Telepathy.Tests
         Server server;
 
         [SetUp]
-        public void Setup()
+        public async Task Setup()
         {
             server = new Server(MaxMessageSize);
             server.Start(port);
+            while (!server.Active)
+            {
+                await Task.Delay(10);
+            }
+            await Task.Delay(500);
         }
 
         [TearDown]
@@ -183,6 +189,357 @@ namespace Telepathy.Tests
             Assert.That(disconnectMsg.eventType, Is.EqualTo(EventType.Disconnected));
 
             client.Disconnect();
+        }
+
+        [Test]
+        public void ClientTest_UDP_ServerMessage()
+        {
+            Encoding utf8 = Encoding.UTF8;
+            Client client = new Client(MaxMessageSize);
+
+            client.Connect("127.0.0.1", port);
+
+            // we  should first receive a connected message
+            Message serverConnectMsg = NextMessage(server);
+            int id = serverConnectMsg.connectionId;
+
+            // we  should first receive a connected message
+            Message clientConnectMsg = NextMessage(client);
+            Assert.That(serverConnectMsg.eventType, Is.EqualTo(EventType.Connected));
+
+            // Send some data to the client
+            byte[] bytes = utf8.GetBytes("Hello world");
+            server.Send_UDP(id, new ArraySegment<byte>(bytes));
+            Message dataMsg = NextMessage(client);
+            Assert.That(dataMsg.eventType, Is.EqualTo(EventType.Data));
+            string str = utf8.GetString(dataMsg.data);
+            Assert.That(str, Is.EqualTo("Hello world"));
+
+            // finally if the server stops,  the clients should get a disconnect error
+            server.Stop();
+            Message disconnectMsg = NextMessage(client);
+            Assert.That(disconnectMsg.eventType, Is.EqualTo(EventType.Disconnected));
+
+            client.Disconnect();
+        }
+
+        [Test]
+        public void ClientTest_UDP()
+        {
+            Encoding utf8 = Encoding.UTF8;
+            Client client1 = new Client(MaxMessageSize);
+            Client client2 = new Client(MaxMessageSize);
+
+            client1.Connect("127.0.0.1", port);
+            // we  should first receive a connected message
+            Message serverConnectMsg1 = NextMessage(server);
+            int id1 = serverConnectMsg1.connectionId;
+            // we  should first receive a connected message
+            Message clientConnectMsg = NextMessage(client1);
+            Assert.That(serverConnectMsg1.eventType, Is.EqualTo(EventType.Connected));
+            
+            client2.Connect("127.0.0.1", port);
+            // we  should first receive a connected message
+            Message serverConnectMsg2 = NextMessage(server);
+            int id2 = serverConnectMsg2.connectionId;
+            // we  should first receive a connected message
+            Message clientConnectMsg2 = NextMessage(client2);
+            Assert.That(serverConnectMsg2.eventType, Is.EqualTo(EventType.Connected));
+
+            Task.Delay(150);
+            {
+                // Send some data to the client
+                byte[] bytes = utf8.GetBytes("Hello world");
+                server.Send(id1, new ArraySegment<byte>(bytes));
+                Message dataMsg = NextMessage(client1);
+                Assert.That(dataMsg.eventType, Is.EqualTo(EventType.Data));
+                string str = utf8.GetString(dataMsg.data);
+                Assert.That(str, Is.EqualTo("Hello world"));
+            }
+            {
+                // Send some data to the client
+                byte[] bytes = utf8.GetBytes("Hello world");
+                server.Send(id2, new ArraySegment<byte>(bytes));
+                Message dataMsg = NextMessage(client2);
+                Assert.That(dataMsg.eventType, Is.EqualTo(EventType.Data));
+                string str = utf8.GetString(dataMsg.data);
+                Assert.That(str, Is.EqualTo("Hello world"));
+            }
+            {
+                // Send some data to the client
+                byte[] bytes = utf8.GetBytes("Hello world");
+                server.Send_UDP(id1, new ArraySegment<byte>(bytes));
+                Message dataMsg = NextMessage(client1);
+                Assert.That(dataMsg.eventType, Is.EqualTo(EventType.Data));
+                string str = utf8.GetString(dataMsg.data);
+                Assert.That(str, Is.EqualTo("Hello world"));
+            }
+            {
+                // Send some data to the client
+                byte[] bytes = utf8.GetBytes("Hello world");
+                server.Send_UDP(id2, new ArraySegment<byte>(bytes));
+                Message dataMsg = NextMessage(client2);
+                Assert.That(dataMsg.eventType, Is.EqualTo(EventType.Data));
+                string str = utf8.GetString(dataMsg.data);
+                Assert.That(str, Is.EqualTo("Hello world"));
+            }
+            {
+                // Send some data to the client
+                byte[] bytes = utf8.GetBytes("Hello world");
+                client1.Send(new ArraySegment<byte>(bytes));
+                Message dataMsg = NextMessage(server);
+                Assert.That(dataMsg.eventType, Is.EqualTo(EventType.Data));
+                string str = utf8.GetString(dataMsg.data);
+                Assert.That(str, Is.EqualTo("Hello world"));
+            }
+            {
+                // Send some data to the client
+                byte[] bytes = utf8.GetBytes("Hello world");
+                client1.Send_UDP(new ArraySegment<byte>(bytes));
+                Message dataMsg = NextMessage(server);
+                Assert.That(dataMsg.eventType, Is.EqualTo(EventType.Data));
+                string str = utf8.GetString(dataMsg.data);
+                Assert.That(str, Is.EqualTo("Hello world"));
+            }
+            {
+                // Send some data to the client
+                byte[] bytes = utf8.GetBytes("Hello world");
+                client2.Send(new ArraySegment<byte>(bytes));
+                Message dataMsg = NextMessage(server);
+                Assert.That(dataMsg.eventType, Is.EqualTo(EventType.Data));
+                string str = utf8.GetString(dataMsg.data);
+                Assert.That(str, Is.EqualTo("Hello world"));
+            }
+            {
+                // Send some data to the client
+                byte[] bytes = utf8.GetBytes("Hello world");
+                client2.Send_UDP(new ArraySegment<byte>(bytes));
+                Message dataMsg = NextMessage(server);
+                Assert.That(dataMsg.eventType, Is.EqualTo(EventType.Data));
+                string str = utf8.GetString(dataMsg.data);
+                Assert.That(str, Is.EqualTo("Hello world"));
+            }
+
+            client1.Disconnect();
+            Message disconnectMsg = NextMessage(server);
+            Assert.That(disconnectMsg.eventType, Is.EqualTo(EventType.Disconnected));
+            
+            client2.Disconnect();
+            Message disconnectMsg2 = NextMessage(server);
+            Assert.That(disconnectMsg2.eventType, Is.EqualTo(EventType.Disconnected));
+        }
+
+        [Test]
+        public void ClientTest_UDP_IpV6()
+        {
+            Encoding utf8 = Encoding.UTF8;
+            Client client1 = new Client(MaxMessageSize);
+            Client client2 = new Client(MaxMessageSize);
+
+            client1.Connect("::ffff:127.0.0.1", port);
+            // we  should first receive a connected message
+            Message serverConnectMsg1 = NextMessage(server);
+            int id1 = serverConnectMsg1.connectionId;
+            // we  should first receive a connected message
+            Message clientConnectMsg = NextMessage(client1);
+            Assert.That(serverConnectMsg1.eventType, Is.EqualTo(EventType.Connected));
+            
+            client2.Connect("::ffff:127.0.0.1", port);
+            // we  should first receive a connected message
+            Message serverConnectMsg2 = NextMessage(server);
+            int id2 = serverConnectMsg2.connectionId;
+            // we  should first receive a connected message
+            Message clientConnectMsg2 = NextMessage(client2);
+            Assert.That(serverConnectMsg2.eventType, Is.EqualTo(EventType.Connected));
+
+            Task.Delay(150);
+            // {
+            //     // Send some data to the client
+            //     byte[] bytes = utf8.GetBytes("Hello world");
+            //     server.Send(id1, new ArraySegment<byte>(bytes));
+            //     Message dataMsg = NextMessage(client1);
+            //     Assert.That(dataMsg.eventType, Is.EqualTo(EventType.Data));
+            //     string str = utf8.GetString(dataMsg.data);
+            //     Assert.That(str, Is.EqualTo("Hello world"));
+            // }
+            // {
+            //     // Send some data to the client
+            //     byte[] bytes = utf8.GetBytes("Hello world");
+            //     server.Send(id2, new ArraySegment<byte>(bytes));
+            //     Message dataMsg = NextMessage(client2);
+            //     Assert.That(dataMsg.eventType, Is.EqualTo(EventType.Data));
+            //     string str = utf8.GetString(dataMsg.data);
+            //     Assert.That(str, Is.EqualTo("Hello world"));
+            // }
+            {
+                // Send some data to the client
+                byte[] bytes = utf8.GetBytes("Hello world");
+                server.Send_UDP(id1, new ArraySegment<byte>(bytes));
+                Message dataMsg = NextMessage(client1);
+                Assert.That(dataMsg.eventType, Is.EqualTo(EventType.Data));
+                string str = utf8.GetString(dataMsg.data);
+                Assert.That(str, Is.EqualTo("Hello world"));
+            }
+            {
+                // Send some data to the client
+                byte[] bytes = utf8.GetBytes("Hello world");
+                server.Send_UDP(id2, new ArraySegment<byte>(bytes));
+                Message dataMsg = NextMessage(client2);
+                Assert.That(dataMsg.eventType, Is.EqualTo(EventType.Data));
+                string str = utf8.GetString(dataMsg.data);
+                Assert.That(str, Is.EqualTo("Hello world"));
+            }
+            {
+                // Send some data to the client
+                byte[] bytes = utf8.GetBytes("Hello world");
+                client1.Send(new ArraySegment<byte>(bytes));
+                Message dataMsg = NextMessage(server);
+                Assert.That(dataMsg.eventType, Is.EqualTo(EventType.Data));
+                string str = utf8.GetString(dataMsg.data);
+                Assert.That(str, Is.EqualTo("Hello world"));
+            }
+            {
+                // Send some data to the client
+                byte[] bytes = utf8.GetBytes("Hello world");
+                client1.Send_UDP(new ArraySegment<byte>(bytes));
+                Message dataMsg = NextMessage(server);
+                Assert.That(dataMsg.eventType, Is.EqualTo(EventType.Data));
+                string str = utf8.GetString(dataMsg.data);
+                Assert.That(str, Is.EqualTo("Hello world"));
+            }
+            {
+                // Send some data to the client
+                byte[] bytes = utf8.GetBytes("Hello world");
+                client2.Send(new ArraySegment<byte>(bytes));
+                Message dataMsg = NextMessage(server);
+                Assert.That(dataMsg.eventType, Is.EqualTo(EventType.Data));
+                string str = utf8.GetString(dataMsg.data);
+                Assert.That(str, Is.EqualTo("Hello world"));
+            }
+            {
+                // Send some data to the client
+                byte[] bytes = utf8.GetBytes("Hello world");
+                client2.Send_UDP(new ArraySegment<byte>(bytes));
+                Message dataMsg = NextMessage(server);
+                Assert.That(dataMsg.eventType, Is.EqualTo(EventType.Data));
+                string str = utf8.GetString(dataMsg.data);
+                Assert.That(str, Is.EqualTo("Hello world"));
+            }
+
+            client1.Disconnect();
+            Message disconnectMsg = NextMessage(server);
+            Assert.That(disconnectMsg.eventType, Is.EqualTo(EventType.Disconnected));
+            
+            client2.Disconnect();
+            Message disconnectMsg2 = NextMessage(server);
+            Assert.That(disconnectMsg2.eventType, Is.EqualTo(EventType.Disconnected));
+        }
+
+        [Test]
+        public void ClientTest_UDP_IpV6_IpV4_Both()
+        {
+            Encoding utf8 = Encoding.UTF8;
+            Client client1 = new Client(MaxMessageSize);
+            Client client2 = new Client(MaxMessageSize);
+
+            client1.Connect("127.0.0.1", port);
+            // we  should first receive a connected message
+            Message serverConnectMsg1 = NextMessage(server);
+            int id1 = serverConnectMsg1.connectionId;
+            // we  should first receive a connected message
+            Message clientConnectMsg = NextMessage(client1);
+            Assert.That(serverConnectMsg1.eventType, Is.EqualTo(EventType.Connected));
+            
+            client2.Connect("::ffff:127.0.0.1", port);
+            // we  should first receive a connected message
+            Message serverConnectMsg2 = NextMessage(server);
+            int id2 = serverConnectMsg2.connectionId;
+            // we  should first receive a connected message
+            Message clientConnectMsg2 = NextMessage(client2);
+            Assert.That(serverConnectMsg2.eventType, Is.EqualTo(EventType.Connected));
+
+            Task.Delay(150);
+            // {
+            //     // Send some data to the client
+            //     byte[] bytes = utf8.GetBytes("Hello world");
+            //     server.Send(id1, new ArraySegment<byte>(bytes));
+            //     Message dataMsg = NextMessage(client1);
+            //     Assert.That(dataMsg.eventType, Is.EqualTo(EventType.Data));
+            //     string str = utf8.GetString(dataMsg.data);
+            //     Assert.That(str, Is.EqualTo("Hello world"));
+            // }
+            // {
+            //     // Send some data to the client
+            //     byte[] bytes = utf8.GetBytes("Hello world");
+            //     server.Send(id2, new ArraySegment<byte>(bytes));
+            //     Message dataMsg = NextMessage(client2);
+            //     Assert.That(dataMsg.eventType, Is.EqualTo(EventType.Data));
+            //     string str = utf8.GetString(dataMsg.data);
+            //     Assert.That(str, Is.EqualTo("Hello world"));
+            // }
+            {
+                // Send some data to the client
+                byte[] bytes = utf8.GetBytes("Hello world");
+                server.Send_UDP(id1, new ArraySegment<byte>(bytes));
+                Message dataMsg = NextMessage(client1);
+                Assert.That(dataMsg.eventType, Is.EqualTo(EventType.Data));
+                string str = utf8.GetString(dataMsg.data);
+                Assert.That(str, Is.EqualTo("Hello world"));
+            }
+            {
+                // Send some data to the client
+                byte[] bytes = utf8.GetBytes("Hello world");
+                server.Send_UDP(id2, new ArraySegment<byte>(bytes));
+                Message dataMsg = NextMessage(client2);
+                Assert.That(dataMsg.eventType, Is.EqualTo(EventType.Data));
+                string str = utf8.GetString(dataMsg.data);
+                Assert.That(str, Is.EqualTo("Hello world"));
+            }
+            {
+                // Send some data to the client
+                byte[] bytes = utf8.GetBytes("Hello world");
+                client1.Send(new ArraySegment<byte>(bytes));
+                Message dataMsg = NextMessage(server);
+                Assert.That(dataMsg.eventType, Is.EqualTo(EventType.Data));
+                string str = utf8.GetString(dataMsg.data);
+                Assert.That(str, Is.EqualTo("Hello world"));
+            }
+            {
+                // Send some data to the client
+                byte[] bytes = utf8.GetBytes("Hello world");
+                client1.Send_UDP(new ArraySegment<byte>(bytes));
+                Message dataMsg = NextMessage(server);
+                Assert.That(dataMsg.eventType, Is.EqualTo(EventType.Data));
+                string str = utf8.GetString(dataMsg.data);
+                Assert.That(str, Is.EqualTo("Hello world"));
+            }
+            {
+                // Send some data to the client
+                byte[] bytes = utf8.GetBytes("Hello world");
+                client2.Send(new ArraySegment<byte>(bytes));
+                Message dataMsg = NextMessage(server);
+                Assert.That(dataMsg.eventType, Is.EqualTo(EventType.Data));
+                string str = utf8.GetString(dataMsg.data);
+                Assert.That(str, Is.EqualTo("Hello world"));
+            }
+            {
+                // Send some data to the client
+                byte[] bytes = utf8.GetBytes("Hello world");
+                client2.Send_UDP(new ArraySegment<byte>(bytes));
+                Message dataMsg = NextMessage(server);
+                Assert.That(dataMsg.eventType, Is.EqualTo(EventType.Data));
+                string str = utf8.GetString(dataMsg.data);
+                Assert.That(str, Is.EqualTo("Hello world"));
+            }
+
+
+            client1.Disconnect();
+            Message disconnectMsg = NextMessage(server);
+            Assert.That(disconnectMsg.eventType, Is.EqualTo(EventType.Disconnected));
+            
+            client2.Disconnect();
+            Message disconnectMsg2 = NextMessage(server);
+            Assert.That(disconnectMsg2.eventType, Is.EqualTo(EventType.Disconnected));
         }
 
         [Test]
