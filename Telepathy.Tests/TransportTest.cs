@@ -701,6 +701,39 @@ namespace Telepathy.Tests
         }
 
         [Test]
+        public void AllocationAttackTest_UDP()
+        {
+            // connect a client
+            // and allow client to send large message
+            int attackSize = MaxMessageSize * 2;
+            Client client = new Client(attackSize);
+            client.Connect("127.0.0.1", port);
+
+            // we should first receive a connected message
+            Message serverConnectMsg = NextMessage(server);
+            int id = serverConnectMsg.connectionId;
+
+            // Send a large message, bigger thank max message size
+            // -> this should disconnect the client
+            byte[] bytes = new byte[attackSize];
+            bool sent = client.Send_UDP(new ArraySegment<byte>(bytes));
+            Assert.That(sent, Is.EqualTo(true));
+            
+            Encoding utf8 = Encoding.UTF8;
+            byte[] bytes2 = utf8.GetBytes("Hello world");
+            client.Send_UDP(new ArraySegment<byte>(bytes2));
+            
+            Message dataMsg = NextMessage(server);
+            Assert.That(dataMsg.eventType, Is.EqualTo(EventType.Data));
+            string str = utf8.GetString(dataMsg.data);
+            Assert.That(str, Is.EqualTo("Hello world"));
+
+            // finally if the server stops,  the clients should get a disconnect error
+            server.Stop();
+            client.Disconnect();
+        }
+
+        [Test]
         public void ServerStartStopTest()
         {
             // create a server that only starts and stops without ever accepting
