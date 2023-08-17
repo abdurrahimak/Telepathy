@@ -56,10 +56,16 @@ namespace Telepathy
                 udpClient.Send(payload, packetSize, endPoint);
                 return true;
             }
+            catch (SocketException socketException)
+            {
+                // log as regular message because servers do shut down sometimes
+                Log.Warning("Send UDP Socket: exception: " + socketException);
+                return false;
+            }
             catch (Exception exception)
             {
                 // log as regular message because servers do shut down sometimes
-                Log.Info("Send: stream.Write exception: " + exception);
+                Log.Info("Send UDP: exception: " + exception);
                 return false;
             }
         }
@@ -245,15 +251,17 @@ namespace Telepathy
                 new Dictionary<IPEndPoint, int>();
 
             int connectionId = default;
-            try
+
+            // TODO: only tcp connected, maybe we can write udpConnected event.
+            while (udpClient.Client != null)
             {
-                // TODO: only tcp connected, maybe we can write udpConnected event.
-                while (true)
+                try
                 {
                     var receivedBytes = udpClient.Receive(ref endPoint);
                     if (receivedBytes.Length > MaxMessageSize)
                     {
-                        Log.Warning("ReadMessageBlocking: possible header attack with a header of: " + receivedBytes.Length + " bytes.");
+                        Log.Warning("ReadMessageBlocking UDP: possible header attack with a header of: " +
+                                    receivedBytes.Length + " bytes.");
                         continue;
                     }
 
@@ -265,7 +273,8 @@ namespace Telepathy
                             var connectionState = kvp.Value;
                             var client = connectionState.client;
                             var clientRemoteEndPoint = client.Client.RemoteEndPoint as IPEndPoint;
-                            var clientEndPoint = new IPEndPoint(clientRemoteEndPoint.Address.MapToIPv6(), clientRemoteEndPoint.Port);
+                            var clientEndPoint = new IPEndPoint(clientRemoteEndPoint.Address.MapToIPv6(),
+                                clientRemoteEndPoint.Port);
                             var receiveEndPointV6 = new IPEndPoint(endPoint.Address.MapToIPv6(), endPoint.Port);
                             if (clientEndPoint.Equals(receiveEndPointV6))
                             {
@@ -288,8 +297,10 @@ namespace Telepathy
                     stream.Write(receivedBytes, 0, receivedBytes.Length);
                     stream.Position = 0u;
                     if (!ReadMessageBlocking(stream, MaxMessageSize, headerBuffer, receiveBuffer, out int size))
-                        // break instead of return so stream close still happens!
-                        break;
+                    {
+                        Log.Error($"ReadMessageBlocking failed for {endPoint}");
+                        continue;
+                    }
 
                     // create arraysegment for the read message
                     ArraySegment<byte> message = new ArraySegment<byte>(receiveBuffer, 0, size);
@@ -306,6 +317,7 @@ namespace Telepathy
                         {
                             Log.Error($"Invalid connection message from {endPoint}");
                         }
+
                         continue;
                     }
 
@@ -326,29 +338,22 @@ namespace Telepathy
                         Log.Warning($"receivePipe reached limit of {QueueLimit} for connectionId {clientConnectionId}");
                     }
                 }
+                catch (ObjectDisposedException objectDisposedException)
+                {
+                    Log.Info("ReceiveLoop_UDP: finished receive function for connectionId=" + connectionId + " reason: " + objectDisposedException);
+                    break;
+                }
+                catch (Exception exception)
+                {
+                    // something went wrong. the thread was interrupted or the
+                    // connection closed or we closed our own connection or ...
+                    // -> either way we should stop gracefully
+                    Log.Info("ReceiveLoop_UDP: finished receive function for connectionId=" + connectionId + " reason: " + exception);
+                }
             }
-            catch (Exception exception)
-            {
-                // something went wrong. the thread was interrupted or the
-                // connection closed or we closed our own connection or ...
-                // -> either way we should stop gracefully
-                Log.Info("ReceiveLoop_UDP: finished receive function for connectionId=" + connectionId + " reason: " + exception);
-            }
-            finally
-            {
-                endPointHashToConnectionId.Clear();
-                stream.Close();
-                // clean up no matter what
-                //stream.Close();
-                //client.Close();
-
-                // add 'Disconnected' message after disconnecting properly.
-                // -> always AFTER closing the streams to avoid a race condition
-                //    where Disconnected -> Reconnect wouldn't work because
-                //    Connected is still true for a short moment before the stream
-                //    would be closed.
-                //receivePipe.Enqueue(connectionId, EventType.Disconnected, default);
-            }
+            
+            endPointHashToConnectionId.Clear();
+            stream.Close();
         }
         
         // thread send function
@@ -449,10 +454,13 @@ namespace Telepathy
                         if (sendPipe.DequeueAndSerializeAll(ref payload, out int packetSize))
                         {
                             // send messages (blocking) or stop if stream is closed
-                        
+
                             if (!SendMessagesBlocking_UDP(udpClient, connectionState.udpEndPoint, payload, packetSize))
+                            {
+                                Log.Warning($"Udp message not sent. Message size: {packetSize}");
                                 // break instead of return so stream close still happens!
-                                break;
+                                continue;
+                            }
                         }
                     }
                     else
