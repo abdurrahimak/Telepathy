@@ -451,6 +451,19 @@ namespace Telepathy
             return "";
         }
 
+        // client's ip is sometimes needed by the server, e.g. for bans
+        public bool TryGetClientEndPoint(int connectionId, out IPEndPoint endPoint)
+        {
+            // find the connection
+            if (clients.TryGetValue(connectionId, out ConnectionState connection))
+            {
+                endPoint = (IPEndPoint)connection.client.Client.RemoteEndPoint;
+                return true;
+            }
+            endPoint = default;
+            return false;
+        }
+
         // disconnect (kick) a client
         public bool Disconnect(int connectionId)
         {
